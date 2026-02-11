@@ -6818,6 +6818,88 @@ collections.crossTab2D = (data, rowKey, colKey, valueFn = null) => {
     chronoSort: timeseries.chronoSort,
   });
 
+  // =========================================================================
+  // SERA v3.1: DEFENSIVE DATE HELPERS
+  // The upstream AI frequently compares dates as strings ("9/24/2025" >= "2025-08-01")
+  // which fails across formats. These helpers parse any format before comparing.
+  // =========================================================================
+
+  const _parseDate = (d) => {
+    if (d == null) return null;
+    if (d instanceof Date) return isNaN(d.getTime()) ? null : d;
+    const s = String(d).trim();
+    // Try native Date first
+    let dt = new Date(s);
+    if (!isNaN(dt.getTime())) return dt;
+    // Handle M/D/YYYY or MM/DD/YYYY
+    const slashMatch = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (slashMatch) {
+      dt = new Date(+slashMatch[3], +slashMatch[1] - 1, +slashMatch[2]);
+      if (!isNaN(dt.getTime())) return dt;
+    }
+    return null;
+  };
+
+  const dateHelpers = {
+    /** Compare dates safely regardless of format. Returns true if date is in [start, end] inclusive. */
+    dateInRange: (dateStr, startStr, endStr) => {
+      const d = _parseDate(dateStr);
+      const s = _parseDate(startStr);
+      const e = _parseDate(endStr);
+      if (!d) return false;
+      if (s && d < s) return false;
+      if (e && d > e) return false;
+      return true;
+    },
+
+    /** Compare two dates. Returns -1, 0, or 1. Works with any parseable format. */
+    dateCompare: (a, b) => {
+      const da = _parseDate(a);
+      const db = _parseDate(b);
+      if (!da || !db) return 0;
+      return da < db ? -1 : da > db ? 1 : 0;
+    },
+
+    /** dateGte: returns true if a >= b (date-aware, format-safe) */
+    dateGte: (a, b) => {
+      const da = _parseDate(a), db = _parseDate(b);
+      return da && db ? da >= db : false;
+    },
+
+    /** dateLte: returns true if a <= b (date-aware, format-safe) */
+    dateLte: (a, b) => {
+      const da = _parseDate(a), db = _parseDate(b);
+      return da && db ? da <= db : false;
+    },
+
+    /** Extract month as zero-padded string ("01"-"12") from any date format */
+    getMonth: (dateStr) => {
+      const d = _parseDate(dateStr);
+      return d ? String(d.getMonth() + 1).padStart(2, "0") : null;
+    },
+
+    /** Extract full year as number from any date format */
+    getYear: (dateStr) => {
+      const d = _parseDate(dateStr);
+      return d ? d.getFullYear() : null;
+    },
+
+    /** Extract YYYY-MM from any date format (safe month key) */
+    monthKey: (dateStr) => {
+      const d = _parseDate(dateStr);
+      if (!d) return null;
+      return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+    },
+
+    /** Parse any date format into a Date object (null if unparseable) */
+    parseDate: _parseDate,
+  };
+
+  // Add to dates module
+  Object.assign(dates, dateHelpers);
+  // Add to timeseries module (AI might call _.timeSeries.dateInRange)
+  Object.assign(timeseries, dateHelpers);
+
   // 5. MAIN EXPORT OBJECT (_)
   // -------------------------------------------------------------------------
   const _ = {
@@ -7170,6 +7252,16 @@ collections.crossTab2D = (data, rowKey, colKey, valueFn = null) => {
     second: dates.second,
     millisecond: dates.millisecond,
     isoWeek: dates.isoWeek,
+
+    // SERA v3.1: Defensive date helpers (AI-proof, format-agnostic)
+    dateInRange: dateHelpers.dateInRange,
+    dateCompare: dateHelpers.dateCompare,
+    dateGte: dateHelpers.dateGte,
+    dateLte: dateHelpers.dateLte,
+    getMonth: dateHelpers.getMonth,
+    getYear: dateHelpers.getYear,
+    monthKey: dateHelpers.monthKey,
+    parseDate: dateHelpers.parseDate,
 
     probability: probability,
     prob: probability,

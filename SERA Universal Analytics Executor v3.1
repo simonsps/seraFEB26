@@ -7183,7 +7183,7 @@ collections.crossTab2D = (data, rowKey, colKey, valueFn = null) => {
 
     // SERA v3.1: Expose commonly AI-guessed module namespaces
     regression: regression,
-    strings: strings,
+    // NOTE: strings added post-hoc below (defined after _ due to file ordering)
     types: types,
 
     safeKeyFn, 
@@ -7328,6 +7328,7 @@ collections.crossTab2D = (data, rowKey, colKey, valueFn = null) => {
 
   // --- Aliases & Cleanup ---
   Object.assign(_, strings);
+  _.strings = strings;  // SERA v3.1: plural form (AI guesses both _.string and _.strings)
   _.string = strings;
   _.str = strings;
   _.search = collections.search;

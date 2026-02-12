@@ -182,6 +182,22 @@ const StandardLibrary = (() => {
       return (row) => _get(row, fn);
     }
 
+    // SERA v3.1 PATCH 49: Object predicate support (lodash _.matches style)
+    // _.filter(arr, {status: 'active'}) → returns rows where row.status === 'active'
+    // _.filter(arr, {category: 'Vitamins', channel: 'Direct'}) → AND match
+    if (fn && typeof fn === "object" && !Array.isArray(fn)) {
+      const entries = Object.entries(fn);
+      return (row) => {
+        if (row == null || typeof row !== "object") return false;
+        for (const [k, v] of entries) {
+          const rowVal = _get(row, k);
+          // Support both strict equality and loose (string coercion) matching
+          if (rowVal !== v && String(rowVal) !== String(v)) return false;
+        }
+        return true;
+      };
+    }
+
     return (x) => x;
   };
 
@@ -817,6 +833,11 @@ compactNumbers: (arr) =>
 
     if (pairs.length < 2) return [];
 
+    // Auto-adjust threshold for small samples: N<20 can't produce z>2.5
+    if (pairs.length < 20) {
+      actualThreshold = Math.min(actualThreshold, Math.max(1.0, pairs.length / 10));
+    }
+
     const values = pairs.map((p) => p.value);
     const mean = stats.avg(values);
     const sd = stats.stddev(values) || 0;
@@ -832,7 +853,11 @@ compactNumbers: (arr) =>
     }
 
     const result = outliers;
+    const highOutliers = outliers.filter(o => o.z > 0);
+    const lowOutliers = outliers.filter(o => o.z < 0);
     Object.defineProperties(result, {
+      high: { value: highOutliers, enumerable: false },
+      low: { value: lowOutliers, enumerable: false },
       threshold: { value: actualThreshold, enumerable: false },
       mean: { value: mean, enumerable: false },
       stddev: { value: sd, enumerable: false },
@@ -887,6 +912,67 @@ outlierRate: (arr, ...args) => {
     return stats.iqrOutliers(arr, key).rate;
   },
 
+  /**
+   * PATCH 54: standouts() — entity-level outlier detection that works at ANY N.
+   * Unlike zScoreOutliers (needs N>30) or iqrOutliers (needs N>4),
+   * standouts uses distance-from-median and always produces results.
+   *
+   * standouts(arr, key?, threshold?)
+   *   - key: field name or extractor function (optional for plain number arrays)
+   *   - threshold: multiplier for "notable" (default 1.5 = 50% above/below median)
+   *
+   * Returns: { high: items[], low: items[], median, mean, spread, all: annotatedItems[] }
+   *   where each item has: { item, value, ratio (value/median), deviation (value - median), notable: bool }
+   */
+  standouts: (arr, key, threshold) => {
+    let actualKey = key;
+    let actualThreshold = threshold;
+    if (typeof key === "number") {
+      actualThreshold = key;
+      actualKey = undefined;
+    }
+    if (actualThreshold == null) actualThreshold = 1.5;
+
+    const fn = actualKey ? safeKeyFn(actualKey) : (x) => x;
+    const original = Array.isArray(arr) ? arr : [];
+    const pairs = [];
+
+    for (let i = 0; i < original.length; i++) {
+      const item = original[i];
+      const val = stats.toNumber(fn(item));
+      if (Number.isFinite(val)) pairs.push({ item, value: val, index: i });
+    }
+
+    if (pairs.length === 0) return { high: [], low: [], median: 0, mean: 0, spread: 0, all: [] };
+
+    const values = pairs.map(p => p.value);
+    const med = stats.median(values);
+    const avg = stats.avg(values);
+    const sd = stats.stddev(values) || 0;
+
+    // If median is zero or near-zero (>50% of values are zero), fall back to mean-based detection
+    const useMedian = med !== 0 && Math.abs(med) > avg * 0.01;
+    const anchor = useMedian ? med : avg;
+    const anchorLabel = useMedian ? "median" : "mean";
+
+    const highThreshold = anchor > 0 ? anchor * actualThreshold : Infinity;
+    const lowThreshold = anchor > 0 ? anchor / actualThreshold : -Infinity;
+
+    const all = pairs.map(p => ({
+      item: p.item,
+      value: p.value,
+      ratio: anchor !== 0 ? p.value / anchor : 0,
+      deviation: p.value - anchor,
+      pctFromMedian: anchor !== 0 ? ((p.value - anchor) / Math.abs(anchor)) * 100 : 0,
+      notable: (highThreshold !== Infinity && p.value >= highThreshold) || (lowThreshold !== -Infinity && lowThreshold > 0 && p.value <= lowThreshold)
+    }));
+
+    const high = all.filter(a => highThreshold !== Infinity && a.value >= highThreshold);
+    const low = all.filter(a => lowThreshold !== -Infinity && lowThreshold > 0 && a.value <= lowThreshold);
+
+    return augmentObject({ high, low, median: med, mean: avg, stddev: sd, spread: sd / (avg || 1), anchor, anchorType: anchorLabel, all });
+  },
+
   spikeDetection: (arr, factor = 3) => {
     const original = Array.isArray(arr) ? arr : [];
     const nums = original.map((v) => stats.toNumber(v));
@@ -920,12 +1006,14 @@ outlierRate: (arr, ...args) => {
     return out;
   },
 
-  cagr: (endValue, beginValue, periods = 1) => {
-    const ev = stats.toNumber(endValue);
+  // SERA v3.1 PATCH 48: Swapped param order to match natural (begin, end) reading.
+  // AI calls cagr(startVal, endVal, periods). Old signature was (endValue, beginValue).
+  cagr: (beginValue, endValue, periods = 1) => {
     const bv = stats.toNumber(beginValue);
+    const ev = stats.toNumber(endValue);
     const n = stats.toNumber(periods);
     if (!Number.isFinite(ev) || !Number.isFinite(bv) || !Number.isFinite(n) || n === 0 || bv === 0) return null;
-    return (ev / bv) ** (1 / n) - 1;
+    return ((ev / bv) ** (1 / n) - 1) * 100;
   },
 
   gini: (arr) => {
@@ -1514,7 +1602,53 @@ outlierRate: (arr, ...args) => {
     uniq: (arr, iteratee) => collections.unique(arr, iteratee),
 
 
-  // ... (existing methods like sumBy, mapNumbers) ...
+  // SERA v3.1 PATCH 50: Implement sumBy, mapNumbers (were ghost references — exported but never defined)
+
+    /** sumBy: lodash-style sum with key/function extractor. _.sumBy(rows, 'net_sales_usd') */
+    sumBy: (arr, iteratee) => {
+      if (!Array.isArray(arr) || !arr.length) return 0;
+      const fn = safeKeyFn(iteratee);
+      let total = 0;
+      for (let i = 0; i < arr.length; i++) {
+        const v = stats.toNumber(fn(arr[i], i));
+        if (Number.isFinite(v)) total += v;
+      }
+      return total;
+    },
+
+    /** mapNumbers: Extract numeric values from array using key. Non-finite values become null. */
+    mapNumbers: (arr, iteratee) => {
+      if (!Array.isArray(arr)) return [];
+      const fn = iteratee !== undefined ? safeKeyFn(iteratee) : (x) => x;
+      return arr.map((row, i) => {
+        const v = stats.toNumber(fn(row, i));
+        return Number.isFinite(v) ? v : null;
+      });
+    },
+
+    /** minBy: lodash-style min with key/function extractor */
+    minBy: (arr, iteratee) => {
+      if (!Array.isArray(arr) || !arr.length) return undefined;
+      const fn = safeKeyFn(iteratee);
+      let best = undefined, bestVal = Infinity;
+      for (const item of arr) {
+        const v = stats.toNumber(fn(item));
+        if (Number.isFinite(v) && v < bestVal) { bestVal = v; best = item; }
+      }
+      return best;
+    },
+
+    /** maxBy: lodash-style max with key/function extractor */
+    maxBy: (arr, iteratee) => {
+      if (!Array.isArray(arr) || !arr.length) return undefined;
+      const fn = safeKeyFn(iteratee);
+      let best = undefined, bestVal = -Infinity;
+      for (const item of arr) {
+        const v = stats.toNumber(fn(item));
+        if (Number.isFinite(v) && v > bestVal) { bestVal = v; best = item; }
+      }
+      return best;
+    },
 
     meanBy: (arr, fn) => {
       const keyFn = safeKeyFn(fn);
@@ -1770,13 +1904,16 @@ outlierRate: (arr, ...args) => {
       return `${y}-${m}-${day}`;
     },
 
-    growth: (cur, prev) => (stats.toNumber(cur) - stats.toNumber(prev)) || 0,
+    // SERA v3.1 PATCH 48: Swapped param order to match natural (from, to) reading.
+    growth: (from, to) => (stats.toNumber(to) - stats.toNumber(from)) || 0,
 
-    growthPct: (cur, prev) => {
-      const p = stats.toNumber(prev);
-      const c = stats.toNumber(cur);
-      if (!Number.isFinite(p) || p === 0 || !Number.isFinite(c)) return 0;
-      return (c - p) / Math.abs(p);
+    // SERA v3.1 PATCH 48: Swapped param order to match natural (from, to) reading.
+    // AI always calls growthPct(startVal, endVal). Old signature was (cur, prev) which inverted results.
+    growthPct: (from, to) => {
+      const f = stats.toNumber(from);
+      const t = stats.toNumber(to);
+      if (!Number.isFinite(f) || f === 0 || !Number.isFinite(t)) return 0;
+      return ((t - f) / Math.abs(f)) * 100;
     },
 
     /**
@@ -1811,7 +1948,7 @@ outlierRate: (arr, ...args) => {
             
             result.prevValue = vPrev;
             if (Number.isFinite(vCur) && Number.isFinite(vPrev) && vPrev !== 0) {
-                result.pctChange = (vCur - vPrev) / Math.abs(vPrev);
+                result.pctChange = ((vCur - vPrev) / Math.abs(vPrev)) * 100;
             } else {
                 result.pctChange = 0;
             }
@@ -2056,7 +2193,7 @@ outlierRate: (arr, ...args) => {
         const curN = Number.isFinite(val) ? val : 0;
         const prevN = Number.isFinite(prevVal) ? prevVal : 0;
         const delta = curN - prevN;
-        const pctChange = (Number.isFinite(prevN) && prevN !== 0) ? delta / Math.abs(prevN) : 0;
+        const pctChange = (Number.isFinite(prevN) && prevN !== 0) ? (delta / Math.abs(prevN)) * 100 : 0;
         const direction = delta > 0 ? "up" : delta < 0 ? "down" : "flat";
 
         out.push({ period, value: val, prevPeriod, prevValue: prevVal, delta, pctChange, direction });
@@ -2122,7 +2259,7 @@ outlierRate: (arr, ...args) => {
       }
 
       const delta = sumB - sumA;
-      const pctChange = sumA !== 0 ? delta / Math.abs(sumA) : 0;
+      const pctChange = sumA !== 0 ? (delta / Math.abs(sumA)) * 100 : 0;
       return { sumA, countA, avgA: countA ? sumA / countA : 0, sumB, countB, avgB: countB ? sumB / countB : 0, delta, pctChange };
     },
 
@@ -2197,8 +2334,8 @@ outlierRate: (arr, ...args) => {
         firstValue: movements[0] && movements[0].value,
         lastValue: movements[movements.length - 1] && movements[movements.length - 1].value,
         overallPctChange: movements.length >= 2 ? timeseries.growthPct(
-          movements[movements.length - 1].value,
-          movements[0].value
+          movements[0].value,
+          movements[movements.length - 1].value
         ) : 0
       };
     },
@@ -5196,6 +5333,7 @@ const optimization = {
   // 2. REPLACEMENT: ANOMALIES MODULE (Fixed "Zero Scores" & Alignment Bugs)
   // =========================================================================
   const anomalies = {
+    standouts: stats.standouts,
     /**
      * 1. MAD Outliers (Robust Median Absolute Deviation)
      * FOREVER FIX: Returns an ARRAY aligned 1:1 with input data.
@@ -6741,7 +6879,16 @@ collections.crossTab2D = (data, rowKey, colKey, valueFn = null) => {
     growthPct: timeseries.growthPct,
     movingAvg: timeseries.movingAvg,
     pctChangeSorted: timeseries.pctChangeSorted,
-    pctChange: timeseries.pctChangeSorted,
+    // SERA v3.1 PATCH 51: pctChange handles both scalar and array calls.
+    // Scalar: _.pctChange(100, 150) → 50 (meaning 50%)
+    // Array:  _.pctChange(rows, 'date', 'value') → sorted period-over-period changes
+    pctChange: (...args) => {
+      if (args.length >= 1 && typeof args[0] === "number") {
+        // Scalar mode: pctChange(from, to)
+        return timeseries.growthPct(args[0], args[1]);
+      }
+      return timeseries.pctChangeSorted(...args);
+    },
     movements1D: timeseries.movements1D,
     movementSummary: timeseries.movementSummary,
     momentum: timeseries.momentum,
@@ -7055,6 +7202,7 @@ collections.crossTab2D = (data, rowKey, colKey, valueFn = null) => {
     stabilityIndex: stats.stabilityIndex,
     iqrOutliers: stats.iqrOutliers,
     zScoreOutliers: stats.zScoreOutliers,
+    standouts: stats.standouts,
     spikeDetection: stats.spikeDetection,
     breakpoints: stats.breakpoints,
     quantile: stats.quantile,
@@ -8332,6 +8480,55 @@ function auditNumericRowsDropped(rawData) {
 
 
   globalThis.rawData = rawData;
+
+  // =========================================================================
+  // SERA v3.1: AUTO-NORMALIZE DATE COLUMNS TO YYYY-MM-DD
+  // The upstream AI frequently does string comparison on dates:
+  //   dateStr >= "2025-08-01" && dateStr <= "2025-12-31"
+  // This fails when data has M/D/YYYY format ("9/24/2025" <= "2025-12-31" → false)
+  // Fix: detect date columns and normalize to YYYY-MM-DD so string compare works.
+  // =========================================================================
+  try {
+    if (Array.isArray(rawData) && rawData.length > 0) {
+      // Sample first 10 rows to detect date columns
+      const sampleRows = rawData.slice(0, Math.min(10, rawData.length));
+      const dateColumns = [];
+      const first = sampleRows.find(r => r && typeof r === "object");
+      if (first) {
+        for (const key of Object.keys(first)) {
+          // Check if this column looks like a date (M/D/YYYY or MM/DD/YYYY pattern)
+          const sampleVals = sampleRows.map(r => r && r[key]).filter(Boolean);
+          const datePattern = /^\d{1,2}\/\d{1,2}\/\d{4}$/;
+          const matchCount = sampleVals.filter(v => typeof v === "string" && datePattern.test(v.trim())).length;
+          if (matchCount >= sampleVals.length * 0.5 && matchCount >= 2) {
+            dateColumns.push(key);
+          }
+        }
+      }
+
+      // Normalize detected date columns in-place
+      if (dateColumns.length > 0) {
+        for (const row of rawData) {
+          if (!row || typeof row !== "object") continue;
+          for (const col of dateColumns) {
+            const val = row[col];
+            if (typeof val === "string") {
+              const m = val.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+              if (m) {
+                const yyyy = m[3];
+                const mm = m[1].padStart(2, "0");
+                const dd = m[2].padStart(2, "0");
+                row[col] = yyyy + "-" + mm + "-" + dd;
+              }
+            }
+          }
+        }
+        globalThis.__seraDebug.push("Auto-normalized date columns: " + dateColumns.join(", "));
+      }
+    }
+  } catch (_) { /* never break execution over date normalization */ }
+  // =========================================================================
+
   globalThis._ = stdlib;
   globalThis.__seraDebug = Array.isArray(globalThis.__seraDebug) ? globalThis.__seraDebug : [];
   globalThis.__numericRowsDropped = auditNumericRowsDropped(rawData);
